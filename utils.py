@@ -71,10 +71,7 @@ def validate_config(cfg: dict) -> None:
     if cfg["keep_last_n_checkpoints"] < 1:
         raise ValueError("keep_last_n_checkpoints must be >= 1")
         
-    if cfg["attention_type"] not in ["linear", "standard"]:
-        raise ValueError("Invalid attention_type")
-    if cfg["pos_encoding"] not in ["rope"]:
-        raise ValueError("Invalid pos_encoding, only rope is supported")
+
         
     if cfg["early_stopping"]["patience"] <= 0 or cfg["early_stopping"]["min_delta"] <= 0:
         raise ValueError("Invalid early stopping params")
