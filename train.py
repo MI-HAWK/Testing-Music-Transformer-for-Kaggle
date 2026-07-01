@@ -36,7 +36,10 @@ def main():
             default_backend = "gloo"
             
         backend = cfg.get("backend", default_backend)
-        dist.init_process_group(backend=backend)
+        try:
+            dist.init_process_group(backend=backend, device_id=device)
+        except TypeError:
+            dist.init_process_group(backend=backend) # fallback for older pytorch
         rank = dist.get_rank()
     else:
         local_rank = 0
@@ -53,11 +56,11 @@ def main():
     if rank == 0:
         count_parameters(model)
         
-    if not args.sanity:
-        try:
-            model = torch.compile(model, mode="default")
-        except Exception as e:
-            if rank == 0: print(f"torch.compile failed: {e}")
+    # if not args.sanity:
+    #     try:
+    #         model = torch.compile(model, mode="default")
+    #     except Exception as e:
+    #         if rank == 0: print(f"torch.compile failed: {e}")
             
     if is_distributed:
         # find_unused_parameters=False in DDP wrapper
