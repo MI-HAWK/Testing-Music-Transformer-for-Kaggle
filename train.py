@@ -45,10 +45,6 @@ def main():
     
     device_type = "cuda" if device.type == "cuda" else "cpu"
         
-    # Data download
-    if rank == 0:
-        from tokenizer import download_maestro
-        download_maestro(cfg)
         
     if is_distributed:
         dist.barrier()
