@@ -3,42 +3,42 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-def causal_linear_attention(q, k, v, cache=None):
-    dtype = q.dtype
-    q, k, v = q.float(), k.float(), v.float()
+class CPAttention(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.n_heads = cfg["n_heads"]
+        self.d_model = cfg["d_model"]
+        self.head_dim = self.d_model // self.n_heads
 
-    q = F.elu(q) + 1.0
-    k = F.elu(k) + 1.0
+        self.wq = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.wk = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.wv = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.wo = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.drop_p = cfg["dropout"]
+        self.drop = nn.Dropout(cfg["dropout"])
 
-    # Normalize to prevent cumsum explosion -> NaN
-    q = q / (q.norm(dim=-1, keepdim=True) + 1e-6)
-    k = k / (k.norm(dim=-1, keepdim=True) + 1e-6)
+    def forward(self, x, cache=None):
+        B, T, C = x.shape
+        q = self.wq(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.wk(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.wv(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
-    EPS = 1e-6
+        if cache is not None:
+            k_cache, v_cache = cache
+            k = torch.cat([k_cache, k], dim=2)
+            v = torch.cat([v_cache, v], dim=2)
+            new_cache = (k, v)
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        else:
+            new_cache = (k, v) if not self.training else None
+            out = F.scaled_dot_product_attention(
+                q, k, v, 
+                dropout_p=self.drop_p if self.training else 0.0, 
+                is_causal=True
+            )
 
-    if cache is not None:
-        S, z = cache
-        S, z = S.float(), z.float()
-        kv = torch.einsum('b h t k, b h t v -> b h k v', k, v)
-        S_new = S + kv
-        z_new = z + k.squeeze(2)
-
-        num = torch.einsum('b h t k, b h k v -> b h t v', q, S_new)
-        den = torch.einsum('b h t k, b h k -> b h t', q, z_new).clamp(min=EPS)
-        out = num / den.unsqueeze(-1)
-        new_cache = (S_new.to(dtype), z_new.to(dtype))
-    else:
-        kv = torch.einsum('b h t k, b h t v -> b h t k v', k, v)
-        S = torch.cumsum(kv, dim=2)
-        z = torch.cumsum(k, dim=2)
-
-        num = torch.einsum('b h t k, b h t k v -> b h t v', q, S)
-        den = torch.einsum('b h t k, b h t k -> b h t', q, z).clamp(min=EPS)
-        out = num / den.unsqueeze(-1)
-        new_cache = (S[:, :, -1, :, :].to(dtype), z[:, :, -1, :].to(dtype))
-
-    out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
-    return out.to(dtype), new_cache
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
+        return self.drop(self.wo(out)), new_cache
 
 
 class SwiGLU(nn.Module):
@@ -51,36 +51,6 @@ class SwiGLU(nn.Module):
 
     def forward(self, x):
         return self.w3(self.w1(x) * F.silu(self.w2(x)))
-
-
-class CPAttention(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        self.n_heads = cfg["n_heads"]
-        self.d_model = cfg["d_model"]
-        self.head_dim = self.d_model // self.n_heads
-
-        self.wq = nn.Linear(self.d_model, self.d_model, bias=False)
-        self.wk = nn.Linear(self.d_model, self.d_model, bias=False)
-        self.wv = nn.Linear(self.d_model, self.d_model, bias=False)
-        self.wo = nn.Linear(self.d_model, self.d_model, bias=False)
-        self.drop = nn.Dropout(cfg["dropout"])
-
-    def forward(self, x, cache=None):
-        B, T, C = x.shape
-        q = self.wq(x).view(B, T, self.n_heads, self.head_dim)
-        k = self.wk(x).view(B, T, self.n_heads, self.head_dim)
-        v = self.wv(x).view(B, T, self.n_heads, self.head_dim)
-
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        out, new_cache = causal_linear_attention(q, k, v, cache)
-        out = out.transpose(1, 2).contiguous().view(B, T, C)
-
-        return self.drop(self.wo(out)), new_cache
-
 
 class CPLayer(nn.Module):
     def __init__(self, cfg):
