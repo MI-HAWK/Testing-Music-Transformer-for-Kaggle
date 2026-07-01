@@ -302,8 +302,12 @@ def get_split_paths(split: str) -> List[Path]:
     csv_path = Path(cfg["maestro_root"]) / "maestro-v3.0.0.csv"
     cache_dir = Path(cfg["midi_cache_dir"])
     
+    if not csv_path.exists():
+        csv_path = cache_dir / "maestro-v3.0.0.csv"
+        
     paths = []
     if not csv_path.exists():
+        print(f"WARNING: Could not find maestro-v3.0.0.csv! Dataset will be empty.")
         return paths
         
     with open(csv_path, "r") as f:
