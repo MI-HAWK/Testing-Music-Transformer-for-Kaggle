@@ -8,6 +8,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.amp import autocast, GradScaler
 from pathlib import Path
 
+import time
 from utils import load_config, validate_config, set_seed, get_lr, get_param_groups, count_parameters, AverageMeter, CheckpointManager, WandBLogger
 from model import CPTransformer
 from dataloader import get_dataloader
@@ -23,6 +24,8 @@ def main():
     cfg = load_config(args.config)
     validate_config(cfg)
     set_seed(cfg["seed"])
+    
+    start_time = time.time()
     
     is_distributed = "LOCAL_RANK" in os.environ
     if is_distributed:
@@ -161,6 +164,34 @@ def main():
                     if is_distributed: dist.destroy_process_group()
                     return
                     
+                # Kaggle 12-hour limit check (DDP synchronized)
+                if step % 50 == 0:
+                    if is_distributed:
+                        timeout_tensor = torch.tensor(1 if time.time() - start_time > 11.5 * 3600 else 0, device=device)
+                        dist.broadcast(timeout_tensor, src=0)
+                        timeout_flag = timeout_tensor.item()
+                    else:
+                        timeout_flag = 1 if time.time() - start_time > 11.5 * 3600 else 0
+                        
+                    if timeout_flag:
+                        if rank == 0:
+                            print(f"Approaching 12-hour Kaggle limit. Saving last step {step} and exiting.")
+                            chkpt_path = Path(cfg["checkpoint_dir"]) / f"last_step_{step}.pt"
+                            torch.save({
+                                "step": step,
+                                "epoch": epoch,
+                                "model_state_dict": (model.module if is_distributed else model).state_dict(),
+                                "optimizer_state_dict": optimizer.state_dict(),
+                                "scaler_state_dict": scaler.state_dict(),
+                                "config": cfg,
+                                "val_loss": best_val_loss,
+                                "best_val_loss": best_val_loss,
+                                "patience_counter": patience_counter
+                            }, chkpt_path)
+                            if args.wandb: logger.finish()
+                        if is_distributed: dist.destroy_process_group()
+                        return
+                    
 
                 if step % cfg["val_every_steps"] == 0:
                     model.eval()
@@ -211,7 +242,7 @@ def main():
                         patience_counter = p_tensor.item()
                         best_val_loss = b_tensor.item()
                         
-                    if patience_counter >= cfg["early_stopping"]["patience"]:
+                    if cfg["early_stopping"]["enabled"] and patience_counter >= cfg["early_stopping"]["patience"]:
                         if rank == 0: print(f"Early stopping at step {step}")
                         if args.wandb and rank == 0: logger.finish()
                         if is_distributed: dist.destroy_process_group()

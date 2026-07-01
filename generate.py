@@ -48,12 +48,13 @@ def main():
     model.eval()
     
     # Load tokenizer
-    tokenizer_path = Path(cfg["midi_cache_dir"]) / "tokenizer.json"
+    cache_path = Path("cache")
+    tokenizer_path = cache_path / "tokenizer.json"
     if not tokenizer_path.exists():
         raise FileNotFoundError(f"Tokenizer not found at {tokenizer_path}. Run tokenizer.py first.")
         
-    # Load tokenizer params directly
-    tokenizer = miditok.CPWord(params=str(tokenizer_path))
+    print(f"Loading tokenizer from {cache_path / 'tokenizer.json'}")
+    tokenizer = miditok.CPWord(params=str(cache_path / "tokenizer.json"))
     
     ign = cfg["special_tokens"]["ignore_idx"]
     pad = cfg["special_tokens"]["pad_idx"]
@@ -63,8 +64,8 @@ def main():
     metric_fam = cfg["special_tokens"]["metric_family_idx"]
     
     active_slots_map = {
-        note_fam: [3, 4, 5], # pitch, duration, velocity
-        metric_fam: [1, 2]   # tempo, position_bar
+        note_fam: [2, 3, 4, 5], # position_bar, pitch, duration, velocity
+        metric_fam: [1]         # tempo
     }
     
     # Initialize sequence with BOS compound word
@@ -96,12 +97,13 @@ def main():
             x = torch.cat([e_f_all, e_t_all, e_p_all, e_pi_all, e_d_all, e_v_all], dim=-1)
             h = model.w_in(x)
             
-            layer_freqs_cis = model.freqs_cis[start_pos:start_pos+T_cur] if model.freqs_cis is not None else None
+            t_pos = torch.arange(start_pos, start_pos + T_cur, device=h.device)
+            h = h + model.abs_pos_emb(t_pos)
                 
             new_caches = []
             for i, layer in enumerate(model.layers):
                 layer_cache = cache[i] if cache is not None else None
-                h, new_c = layer(h, layer_freqs_cis, layer_cache)
+                h, new_c = layer(h, layer_cache)
                 new_caches.append(new_c)
             cache = new_caches
                 
@@ -147,7 +149,12 @@ def main():
             active = active_slots_map.get(f_hat, [])
             for slot_idx in active:
                 l_slot = logits_list[slot_idx][0].clone()
-                l_slot[ign] = -float('Inf')
+                # DO NOT mask out 0 for tempo or position_bar when generating a metric token! 
+                # 0 means Ignore_None for Tempo, and Bar_None for Position. Both are used in Bar tokens!
+                if slot_idx in [1, 2] and f_hat == metric_fam:
+                    pass
+                else:
+                    l_slot[ign] = -float('Inf')
                 l_slot[pad] = -float('Inf')
                 
                 key = keys[slot_idx]
@@ -155,6 +162,10 @@ def main():
                 top_p = cfg["sampling"][key]["top_p"]
                 
                 sampled_val = top_p_sampling(l_slot.unsqueeze(0), top_p=top_p, temperature=tau).item()
+                if key == "position_bar":
+                    probs = torch.nn.functional.softmax(l_slot, dim=-1)
+                    top_probs, top_indices = torch.topk(probs, 5)
+                    print(f"Position Top 5 Probs: {top_probs.tolist()} at indices {top_indices.tolist()}")
                 new_cp[slot_idx] = sampled_val
                 
             new_cp_tensor = torch.tensor([new_cp], dtype=torch.long, device=device).unsqueeze(0)
@@ -223,37 +234,49 @@ def main():
         miditok_cp[0] = tokenizer.vocab[0][f_str]
         
         if f_val == note_fam:
-            pos_val = cp[2] - 2
-            pitch_val = cp[3] - 2 + 21
-            vel_idx = cp[5] - 2
-            miditok_cp[1] = safe_lookup(1, "Position", pos_val)
-            miditok_cp[2] = safe_lookup(2, "Pitch", pitch_val)
-            miditok_cp[3] = safe_lookup(3, "Velocity", vel_idx + 4)
-            miditok_cp[4] = min(cp[4] + 2, len(tokenizer.vocab[4]) - 1) # duration index
-            miditok_cp[5] = safe_lookup(5, "Tempo", "Ignore")
-        elif f_val == metric_fam:
-            pos_val = cp[2] - 2
-            tempo_idx = cp[1] - 2
+            miditok_cp[1] = tokenizer.vocab[1].get("Ignore_None", 0)
             
-            # If the model generated an invalid tempo (e.g. Ignore/PAD), skip this metric token
-            # to prevent miditok from crashing with 'None' string conversion.
-            if cp[1] < 2:
-                continue
-                
-            miditok_cp[1] = safe_lookup(1, "Position", pos_val)
-            miditok_cp[2] = safe_lookup(2, "Pitch", "Ignore")
-            miditok_cp[3] = safe_lookup(3, "Velocity", "Ignore")
-            miditok_cp[4] = safe_lookup(4, "Duration", "Ignore")
-            miditok_cp[5] = min(tempo_idx + 4, len(tokenizer.vocab[5]) - 1) # tempo index
+            pitch_val = cp[3] + 21 - 2
+            miditok_cp[2] = safe_lookup(2, "Pitch", pitch_val)
+            
+            vel_idx = cp[5] - 2
+            vel_val = tokenizer.velocities[vel_idx] if vel_idx >= 0 and vel_idx < len(tokenizer.velocities) else 0
+            miditok_cp[3] = safe_lookup(3, "Velocity", vel_val)
+            
+            dur_id = cp[4] + 2 if cp[4] >= 2 else list(tokenizer.vocab[4].values())[0]
+            dur_id = min(dur_id, len(tokenizer.vocab[4]) - 1)
+            miditok_cp[4] = dur_id
+            miditok_cp[5] = tokenizer.vocab[5].get("Ignore_None", 0)
+            
+        elif f_val == metric_fam:
+            if cp[2] == 0:
+                miditok_cp[1] = safe_lookup(1, "Bar", "None")
+            else:
+                pos_val = cp[2] - 2
+                miditok_cp[1] = safe_lookup(1, "Position", pos_val)
+            
+            miditok_cp[2] = tokenizer.vocab[2].get("Ignore_None", 0)
+            miditok_cp[3] = tokenizer.vocab[3].get("Ignore_None", 0)
+            miditok_cp[4] = tokenizer.vocab[4].get("Ignore_None", 0)
+            
+            tempo_idx = cp[1] - 2
+            if tempo_idx >= 0 and tempo_idx < len(tokenizer.tempos):
+                tempo_val = tokenizer.tempos[tempo_idx]
+                miditok_cp[5] = safe_lookup(5, "Tempo", tempo_val)
+            else:
+                miditok_cp[5] = tokenizer.vocab[5].get("Ignore_None", 0)
             
         miditok_seq.append(miditok_cp)
         
     # Convert to midi
-    from miditok.classes import Event, TokSequence
+    from miditok.classes import TokSequence
     ts = miditok_seq
+    try:
+        midi = tokenizer.tokens_to_midi([TokSequence(ids=ts, ids_bpe_encoded=False)])
+    except Exception as e:
+        print("Failed to convert to midi. Exception:", e)
+        raise e
                     
-    midi = tokenizer.tokens_to_midi([TokSequence(ids=ts, ids_bpe_encoded=False)])
-    
     midi.dump(args.output)
     print(f"Saved generated MIDI to {args.output}")
 
