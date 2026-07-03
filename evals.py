@@ -80,31 +80,47 @@ def compute_fmd(generated_h, ref_h):
     return fmd
 
 def extract_features(model, midi_path, cfg):
-    # Use tokenizer to get CP sequence, then model to get h_t
+    """Run a CP sequence through the model and return the mean hidden state.
+    Uses the same forward pass as CPTransformer.forward() with absolute positional
+    embeddings, clamped to the trained max_seq_len range."""
     from tokenizer import CPTokenizer
     tok = CPTokenizer(cfg)
     seq = tok.process_midi(Path(midi_path))
     if seq is None: return None
-    
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    seq = seq.unsqueeze(0).to(device)
+    seq = seq.unsqueeze(0).to(device)  # [1, L, 6]
+
     with torch.no_grad():
-        e_f = model.emb_family(seq[:, :, 0])
-        e_t = model.emb_tempo(seq[:, :, 1])
-        e_p = model.emb_pos(seq[:, :, 2])
-        e_pi = model.emb_pitch(seq[:, :, 3])
-        e_d = model.emb_dur(seq[:, :, 4])
-        e_v = model.emb_vel(seq[:, :, 5])
-        
+        vs = cfg["vocab_sizes"]
+        # Clamp token indices to stay within each vocab, then truncate to trained
+        # positional range so abs_pos_emb is never called with untrained slots.
+        max_pos = cfg["max_seq_len"]
+        f_in  = torch.clamp(seq[:, :max_pos, 0], max=vs["family"] - 1)
+        t_in  = torch.clamp(seq[:, :max_pos, 1], max=vs["tempo"] - 1)
+        p_in  = torch.clamp(seq[:, :max_pos, 2], max=vs["position_bar"] - 1)
+        pi_in = torch.clamp(seq[:, :max_pos, 3], max=vs["pitch"] - 1)
+        d_in  = torch.clamp(seq[:, :max_pos, 4], max=vs["duration"] - 1)
+        v_in  = torch.clamp(seq[:, :max_pos, 5], max=vs["velocity"] - 1)
+
+        e_f  = model.emb_family(f_in)
+        e_t  = model.emb_tempo(t_in)
+        e_p  = model.emb_pos(p_in)
+        e_pi = model.emb_pitch(pi_in)
+        e_d  = model.emb_dur(d_in)
+        e_v  = model.emb_vel(v_in)
+
         x = torch.cat([e_f, e_t, e_p, e_pi, e_d, e_v], dim=-1)
         h = model.w_in(x)
-        
-        freqs_cis = model.freqs_cis
-            
+
+        T = h.shape[1]
+        t_pos = torch.arange(T, device=h.device)  # [0 .. T-1], always within trained range
+        h = h + model.abs_pos_emb(t_pos)
+
         for layer in model.layers:
-            h, _ = layer(h, freqs_cis)
+            h, _ = layer(h, cache=None)  # CPLayer.forward(x, cache=None)
         h = model.norm(h)
-        
+
     return h[0].cpu().numpy().mean(axis=0)
 
 def main():

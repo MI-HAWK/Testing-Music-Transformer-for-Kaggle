@@ -88,7 +88,8 @@ class CPTransformer(nn.Module):
         total_emb = es["family"] + es["tempo"] + es["position_bar"] + es["pitch"] + es["duration"] + es["velocity"]
         self.w_in = nn.Linear(total_emb, cfg["d_model"], bias=False)
 
-        self.abs_pos_emb = nn.Embedding(4096, cfg["d_model"])
+        # Positional embeddings beyond max_seq_len will be untrained and randomly initialised, therefore model won't generate good sound beyond max_seq_len. However, keeping 4096 makes the model adaptable (using fine-tuning) for longer sequences in the future.
+        self.abs_pos_emb = nn.Embedding(cfg["max_position_embeddings"], cfg["d_model"])
 
         self.layers = nn.ModuleList([CPLayer(cfg) for _ in range(cfg["n_layers"])])
         self.norm = nn.LayerNorm(cfg["d_model"])
@@ -100,7 +101,7 @@ class CPTransformer(nn.Module):
         self.w_out_dur = nn.Linear(cfg["d_model"] + es["family"], vs["duration"], bias=False)
         self.w_out_vel = nn.Linear(cfg["d_model"] + es["family"], vs["velocity"], bias=False)
 
-    def forward(self, cp_seq, target_seq=None, cache=None, start_pos=0):
+    def forward(self, cp_seq, target_seq):
         B, T, _ = cp_seq.shape
 
         vs = self.cfg["vocab_sizes"]
@@ -121,24 +122,19 @@ class CPTransformer(nn.Module):
         x = torch.cat([e_f, e_t, e_p, e_pi, e_d, e_v], dim=-1)
         h = self.w_in(x)
 
-        t_pos = torch.arange(start_pos, start_pos + T, device=h.device)
+        t_pos = torch.arange(0, T, device=h.device)
         h = h + self.abs_pos_emb(t_pos)
 
-        new_caches = []
-        for i, layer in enumerate(self.layers):
-            layer_cache = cache[i] if cache is not None else None
-            h, new_c = layer(h, layer_cache)
-            new_caches.append(new_c)
+        for layer in self.layers:
+            h, _ = layer(h, cache=None)
 
         h = self.norm(h)
 
         logits_f = self.w_f(h)
 
-        if target_seq is not None:
-            gt_f = torch.clamp(target_seq[:, :, 0], max=vs["family"] - 1)
-            e_f_stage2 = self.emb_family(gt_f)
-        else:
-            e_f_stage2 = e_f
+        # Teacher-force Stage 2 with ground-truth family token
+        gt_f = torch.clamp(target_seq[:, :, 0], max=vs["family"] - 1)
+        e_f_stage2 = self.emb_family(gt_f)
 
         h_cond = torch.cat([h, e_f_stage2], dim=-1)
 
@@ -148,17 +144,11 @@ class CPTransformer(nn.Module):
         logits_d  = self.w_out_dur(h_cond)
         logits_v  = self.w_out_vel(h_cond)
 
-        if target_seq is not None:
-            loss_dict = self.compute_loss(
-                [logits_f, logits_t, logits_p, logits_pi, logits_d, logits_v],
-                target_seq
-            )
-            return loss_dict
-
-        out_logits = (logits_f, logits_t, logits_p, logits_pi, logits_d, logits_v)
-        if cache is not None or not self.training:
-            return out_logits, new_caches
-        return out_logits
+        loss_dict = self.compute_loss(
+            [logits_f, logits_t, logits_p, logits_pi, logits_d, logits_v],
+            target_seq
+        )
+        return loss_dict
 
     def compute_loss(self, logits_list, target_seq):
         ign = self.special["ignore_idx"]

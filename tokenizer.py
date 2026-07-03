@@ -178,18 +178,13 @@ class CPTokenizer:
                     val = int(ev.value)
                     mapped_tokens[t, 3] = (val - 21) + 2
                 elif ev.type == "Duration":
-                    # duration string might be "1.0.8" meaning 1 beat, 0, 8 ticks
-                    # miditok duration string parsing might be tricky, we just map index from miditok's vocab
-                    # but wait, it's safer to just get miditok's token index!
-                    # Let's just use miditok's token indices, they are 0-indexed per type!
-                    pass
+                    # miditok CPWord column order: Family(0), Position(1), Pitch(2),
+                    # Velocity(3), Duration(4), Tempo(5). Use raw_tokens[t, 4] for
+                    # the duration token index, then shift by -2 to align with our
+                    # vocab layout where real values start at index 2.
+                    tok_id = int(raw_tokens[t, 4])
+                    mapped_tokens[t, 4] = max(2, tok_id - 2)
                     
-        # An even simpler and robust way: 
-        # just use miditok's raw token integers and shift them by 2 (to make room for ignore=0, PAD=1)
-        # Because miditok assigns IDs from 0 upwards per token type!
-        # wait, miditok already adds PAD, BOS, EOS, MASK in its vocabs at 0, 1, 2, 3?
-        # Let's just map from miditok's integer IDs.
-        
         return mapped_tokens
 
 def tokenize():

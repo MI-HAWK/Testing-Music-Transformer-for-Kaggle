@@ -83,6 +83,16 @@ def main():
             else:
                 cur_seq = input_seq[:, -1:]
                 start_pos = input_seq.shape[1] - 1
+                # Clamp so abs_pos_emb only indexes trained slots [0, max_seq_len-1].
+                # The KV-cache still carries the full history; only the positional
+                # signal degrades gracefully instead of hitting random embeddings.
+                max_trained_pos = cfg["max_seq_len"] - 1
+                if start_pos > max_trained_pos:
+                    if start_pos == max_trained_pos + 1:  # warn once
+                        print(f"Warning: generation exceeded trained positional range "
+                              f"({cfg['max_seq_len']} tokens). Clamping pos embedding "
+                              f"to slot {max_trained_pos}.")
+                    start_pos = max_trained_pos
                 
             # Forward pass
             B, T_cur, _ = cur_seq.shape

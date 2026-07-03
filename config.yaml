@@ -1,6 +1,7 @@
 maestro_root: /kaggle/input/datasets/arnavsadhwani/repo-12/cp_music_transformer/maestro-v3.0.0/
 midi_cache_dir: /kaggle/input/datasets/arnavsadhwani/midi-files/cache/
 max_seq_len: 512
+max_position_embeddings: 4096
 beat_subdivisions: 16
 sustain_pedal: true
 chunk_stride: 256
