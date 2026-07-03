@@ -1,5 +1,5 @@
 maestro_root: /kaggle/input/datasets/arnavsadhwani/repo-12/cp_music_transformer/maestro-v3.0.0/
-midi_cache_dir: /kaggle/input/datasets/arnavsadhwani/midi-files/cache/
+midi_cache_dir: /kaggle/input/datasets/lakshaykhurana23/midi-files/cache/
 max_seq_len: 512
 max_position_embeddings: 4096
 beat_subdivisions: 16
@@ -12,6 +12,7 @@ chunk_stride: 256
 
 vocab_sizes:
   family: 6        # [ignore], [PAD], EOS, BOS, note, metric
+  
   tempo: 60        # 58 bins + [ignore] + [PAD]
   position_bar: 128 # increased from 19 to handle miditok's 64 beat subdivisions + [ignore] + [PAD]
   pitch: 90        # 88 piano keys MIDI 21-108 + [ignore] + [PAD]
