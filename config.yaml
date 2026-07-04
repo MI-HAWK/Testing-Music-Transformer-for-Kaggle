@@ -1,5 +1,5 @@
 maestro_root: maestro-v3.0.0/
-midi_cache_dir: /kaggle/input/datasets/arnavsadhwani/midi-files/cache/
+midi_cache_dir: /kaggle/input/datasets/lakshaykhurana23/midi-files/cache/
 max_seq_len: 512
 max_position_embeddings: 4096
 beat_subdivisions: 16
