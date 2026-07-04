@@ -6,6 +6,7 @@ from model import CPTransformer
 from utils import set_seed
 import miditok
 import numpy as np
+from collections import Counter
 
 def top_p_sampling(logits, top_p, temperature=1.0):
     logits = logits / temperature
@@ -39,7 +40,16 @@ def main():
     
     chkpt = torch.load(args.checkpoint, map_location=device)
     cfg = chkpt["config"]
+
+    # Precompute velocity bins that exactly match the tokenizer's encoding path.
+    # tokenizer.velocities does not exist on miditok CPWord; we reconstruct from cfg.
+    velocity_bins = np.linspace(
+        cfg["velocity_bins"]["min_val"],
+        cfg["velocity_bins"]["max_val"],
+        cfg["velocity_bins"]["n_bins"]
+    )
     
+    cfg["max_position_embeddings"] = cfg.get("max_position_embeddings", 4096)
     model = CPTransformer(cfg).to(device)
     
     state_dict = chkpt["model_state_dict"]
@@ -55,6 +65,63 @@ def main():
         
     print(f"Loading tokenizer from {cache_path / 'tokenizer.json'}")
     tokenizer = miditok.CPWord(params=str(cache_path / "tokenizer.json"))
+
+    # Build ordered vocab-ID lookup tables that mirror the encoding sort order.
+    # safe_lookup(prefix, val) can fail silently (e.g. "Velocity_0" is not in miditok vocab
+    # because velocity=0 means note-off). Direct bin-index → vocab-ID is more robust.
+
+    # Velocity: extract "Velocity_X" entries, sort by X, collect IDs.
+    _vel_items = [(int(k.split("_")[1]), v)
+                  for k, v in tokenizer.vocab[3].items() if k.startswith("Velocity_")]
+    _vel_items.sort()
+    vel_vocab_ids = [v for _, v in _vel_items]   # index = bin index (0-based)
+
+    # Tempo: extract "Tempo_X" entries, sort by X, collect IDs.
+    _tmp_items = [(float(k.split("_")[1]), v)
+                  for k, v in tokenizer.vocab[5].items() if k.startswith("Tempo_")]
+    _tmp_items.sort()
+    tempo_vocab_ids = [v for _, v in _tmp_items]  # index = bin index (0-based)
+    last_valid_tempo_id = tokenizer.vocab[5].get("Tempo_120.0", tempo_vocab_ids[len(tempo_vocab_ids)//2] if tempo_vocab_ids else 0)
+
+    # Position: extract "Position_X" entries, sort by X, collect IDs.
+    # position_bar vocab size is 128 but valid positions are only 0..N (e.g. 0..63 for 4/4 at
+    # 16 subdivisions/beat). Anything outside that range would cause safe_lookup to fall back
+    # to the first vocab item (Bar_None/Ignore_None) and corrupt the note placement.
+    _pos_items = [(int(k.split("_")[1]), v)
+                  for k, v in tokenizer.vocab[1].items() if k.startswith("Position_")]
+    _pos_items.sort()
+    pos_vocab_ids = [v for _, v in _pos_items]   # index = position value (0-based)
+    max_valid_pos = len(pos_vocab_ids) - 1       # e.g. 63 for 4 beats × 16 subdivisions
+
+    # Duration: extract "Duration_*" entries, sort by miditok internal ID.
+    _dur_items = [(v, k) for k, v in tokenizer.vocab[4].items() if k.startswith("Duration_")]
+    _dur_items.sort()
+    dur_vocab_ids = [v for v, _ in _dur_items]   # sorted by miditok internal ID
+    dur_set = set(dur_vocab_ids)                  # for O(1) membership checks in decode
+    n_real_durations = len(dur_vocab_ids)
+
+    # -----------------------------------------------------------------------
+    # Pre-compute upper-bound masks for sampling.
+    #
+    # Our stored encoding: stored_val = max(2, miditok_id - 2)
+    # Inverse decode: miditok_id = stored_val + 2
+    # So: max valid stored_val = len(sub_vocab) - 1 - 2 = len(sub_vocab) - 3
+    #
+    # vocab_size in config (e.g. 128 for duration) is an UPPER BOUND, not the
+    # actual count. If the model samples any index above max_valid_dur_stored,
+    # decode clamps it to the longest duration → all notes sustain forever →
+    # giant wall of sound (“clubbed in one”).
+    # -----------------------------------------------------------------------
+    # max_valid_dur_stored: highest model index that maps to a real miditok duration.
+    # Encoding was: stored = max(2, miditok_id - 2).  Invert: miditok_id = stored + 2.
+    max_valid_dur_stored  = max(2, max(dur_vocab_ids) - 2) if dur_vocab_ids else 2
+    max_valid_pos_stored  = max_valid_pos + 2             # inclusive max for cp[2]
+
+    print(f"[Vocab sizes] position:{len(tokenizer.vocab[1])} pitch:{len(tokenizer.vocab[2])} "
+          f"velocity:{len(tokenizer.vocab[3])} duration:{len(tokenizer.vocab[4])} "
+          f"tempo:{len(tokenizer.vocab[5])}")
+    print(f"[Max valid stored] pos:{max_valid_pos_stored} dur:{max_valid_dur_stored}")
+    print(f"[Duration vocab] {n_real_durations} real tokens, miditok IDs: {dur_vocab_ids}")
     
     ign = cfg["special_tokens"]["ignore_idx"]
     pad = cfg["special_tokens"]["pad_idx"]
@@ -64,8 +131,8 @@ def main():
     metric_fam = cfg["special_tokens"]["metric_family_idx"]
     
     active_slots_map = {
-        note_fam: [2, 3, 4, 5], # position_bar, pitch, duration, velocity
-        metric_fam: [1]         # tempo
+        note_fam:   [3, 4, 5],    # pitch, duration, velocity
+        metric_fam: [1, 2],       # tempo AND position_bar (needed for beat-position tokens)
     }
     
     # Initialize sequence with BOS compound word
@@ -75,6 +142,8 @@ def main():
     print(f"Generating sequence of max length {args.max_len}...")
     
     cache = None
+    consecutive_notes = 0
+    dur_histogram = Counter()
     with torch.no_grad():
         for t in range(args.max_len):
             if cache is None:
@@ -130,6 +199,12 @@ def main():
             l_f[ign] = -float('Inf')
             l_f[pad] = -float('Inf')
             l_f[bos_fam] = -float('Inf')
+
+            # Autoregressive models often get stuck in note-generating loops (wall of sound).
+            # We add a progressive penalty to force a Metric (time-advancing) token.
+            if consecutive_notes >= 8:
+                boost = 2.0 * (consecutive_notes - 7)
+                l_f[metric_fam] = l_f[metric_fam] + min(boost, 15.0)
             
             tau_f = cfg["sampling"]["family"]["tau"] * args.tau_scale
             top_p_f = cfg["sampling"]["family"]["top_p"]
@@ -140,6 +215,11 @@ def main():
                 print(f"EOS generated at step {t+1} of max {args.max_len}.")
                 break
                 
+            if f_hat == note_fam:
+                consecutive_notes += 1
+            else:
+                consecutive_notes = 0
+
             new_cp = [f_hat, ign, ign, ign, ign, ign]
             
             # Stage 2 - condition on f_hat and h_t
@@ -166,23 +246,41 @@ def main():
                 else:
                     l_slot[ign] = -float('Inf')
                 l_slot[pad] = -float('Inf')
-                
+
+                # Upper-bound mask: prevent sampling indices that decode to out-of-range
+                # miditok token IDs.  Without this, ANY index above the valid ceiling
+                # silently gets clamped to the maximum token (e.g. longest duration),
+                # which causes ALL notes to sustain forever → dense wall of sound.
+                if slot_idx == 4:   # duration
+                    if max_valid_dur_stored + 1 < l_slot.shape[0]:
+                        l_slot[max_valid_dur_stored + 1:] = -float('Inf')
+                elif slot_idx == 2: # position_bar
+                    if max_valid_pos_stored + 1 < l_slot.shape[0]:
+                        l_slot[max_valid_pos_stored + 1:] = -float('Inf')
+                        # For metric tokens, also allow index 0 (Bar_None); for note
+                        # tokens it is already masked above by the ign mask.
+
                 key = keys[slot_idx]
                 tau = cfg["sampling"][key]["tau"] * args.tau_scale
                 top_p = cfg["sampling"][key]["top_p"]
                 
                 sampled_val = top_p_sampling(l_slot.unsqueeze(0), top_p=top_p, temperature=tau).item()
-                if key == "position_bar":
-                    probs = torch.nn.functional.softmax(l_slot, dim=-1)
-                    top_probs, top_indices = torch.topk(probs, 5)
-                    print(f"Position Top 5 Probs: {top_probs.tolist()} at indices {top_indices.tolist()}")
                 new_cp[slot_idx] = sampled_val
+                if slot_idx == 4:  # duration — track for diagnostic histogram
+                    dur_histogram[sampled_val] += 1
                 
             new_cp_tensor = torch.tensor([new_cp], dtype=torch.long, device=device).unsqueeze(0)
             input_seq = torch.cat([input_seq, new_cp_tensor], dim=1)
             
         else:
             print(f"Warning: max_len={args.max_len} reached without EOS — piece may be truncated.")
+
+    # Duration diagnostic: show distribution of sampled duration indices
+    if dur_histogram:
+        print(f"\n[Duration histogram] {dict(sorted(dur_histogram.items()))}")
+        print(f"[Valid range] 2 to {max_valid_dur_stored}")
+        out_of_range = sum(v for k, v in dur_histogram.items() if k < 2 or k > max_valid_dur_stored)
+        print(f"[Out-of-range samples] {out_of_range} / {sum(dur_histogram.values())}")
             
     # Remove BOS
     gen_seq = input_seq[0, 1:].cpu().numpy() # [T, 6]
@@ -232,6 +330,7 @@ def main():
             return tokenizer.vocab[vocab_idx][key]
         return list(tokenizer.vocab[vocab_idx].values())[0]
 
+    last_pos_val = -1
     for step in range(len(gen_seq)):
         cp = gen_seq[step]
         f_val = cp[0]
@@ -244,37 +343,63 @@ def main():
         miditok_cp[0] = tokenizer.vocab[0][f_str]
         
         if f_val == note_fam:
+            # Note tokens inherit position from the preceding Metric token.
+            # miditok strictly expects Ignore_None for the position slot of Note tokens.
             miditok_cp[1] = tokenizer.vocab[1].get("Ignore_None", 0)
             
             pitch_val = cp[3] + 21 - 2
             miditok_cp[2] = safe_lookup(2, "Pitch", pitch_val)
             
+            # Velocity: use bin-index directly into sorted vocab IDs to avoid
+            # safe_lookup failing on values like 0 that may not exist in miditok vocab.
             vel_idx = cp[5] - 2
-            vel_val = tokenizer.velocities[vel_idx] if vel_idx >= 0 and vel_idx < len(tokenizer.velocities) else 0
-            miditok_cp[3] = safe_lookup(3, "Velocity", vel_val)
+            if 0 <= vel_idx < len(vel_vocab_ids):
+                miditok_cp[3] = vel_vocab_ids[vel_idx]
+            else:
+                miditok_cp[3] = vel_vocab_ids[len(vel_vocab_ids) // 2]  # fallback: mezzo-forte
             
-            dur_id = cp[4] + 2 if cp[4] >= 2 else list(tokenizer.vocab[4].values())[0]
-            dur_id = min(dur_id, len(tokenizer.vocab[4]) - 1)
-            miditok_cp[4] = dur_id
+            # Duration: stored → miditok_id.  Validate against actual duration vocab
+            # to avoid clamping invalid indices to the longest duration (wall of sound).
+            dur_miditok_id = cp[4] + 2
+            if dur_miditok_id in dur_set:
+                miditok_cp[4] = dur_miditok_id
+            elif dur_vocab_ids:
+                # Snap to nearest valid duration (avoids defaulting to max)
+                miditok_cp[4] = min(dur_vocab_ids, key=lambda x: abs(x - dur_miditok_id))
+            else:
+                miditok_cp[4] = tokenizer.vocab[4].get("Ignore_None", 0)
             miditok_cp[5] = tokenizer.vocab[5].get("Ignore_None", 0)
             
         elif f_val == metric_fam:
-            if cp[2] == 0:
+            # Enforce a constant tempo to prevent erratic playback speeds
+            tempo_id = tokenizer.vocab[5].get("Tempo_120.0", tempo_vocab_ids[len(tempo_vocab_ids)//2])
+
+            # cp[2] == 0 (ignore) means this is a Bar token; otherwise it's a beat position.
+            if cp[2] <= 1:
                 miditok_cp[1] = safe_lookup(1, "Bar", "None")
+                last_pos_val = -1
             else:
-                pos_val = cp[2] - 2
-                miditok_cp[1] = safe_lookup(1, "Position", pos_val)
+                # Clamp to valid position range before lookup.
+                pos_val = min(max(0, cp[2] - 2), max_valid_pos)
+                
+                # Auto-inject Bar token if position wrapped around
+                if last_pos_val != -1 and pos_val < last_pos_val:
+                    bar_cp = [0]*6
+                    bar_cp[0] = tokenizer.vocab[0]["Family_Metric"]
+                    bar_cp[1] = tokenizer.vocab[1].get("Bar_None", 5)
+                    bar_cp[2] = tokenizer.vocab[2].get("Ignore_None", 0)
+                    bar_cp[3] = tokenizer.vocab[3].get("Ignore_None", 0)
+                    bar_cp[4] = tokenizer.vocab[4].get("Ignore_None", 0)
+                    bar_cp[5] = tempo_id  # Pass valid tempo to prevent miditok decode crashes
+                    miditok_seq.append(bar_cp)
+                    
+                last_pos_val = pos_val
+                miditok_cp[1] = pos_vocab_ids[pos_val]
             
             miditok_cp[2] = tokenizer.vocab[2].get("Ignore_None", 0)
             miditok_cp[3] = tokenizer.vocab[3].get("Ignore_None", 0)
             miditok_cp[4] = tokenizer.vocab[4].get("Ignore_None", 0)
-            
-            tempo_idx = cp[1] - 2
-            if tempo_idx >= 0 and tempo_idx < len(tokenizer.tempos):
-                tempo_val = tokenizer.tempos[tempo_idx]
-                miditok_cp[5] = safe_lookup(5, "Tempo", tempo_val)
-            else:
-                miditok_cp[5] = tokenizer.vocab[5].get("Ignore_None", 0)
+            miditok_cp[5] = tempo_id
             
         miditok_seq.append(miditok_cp)
         
@@ -282,7 +407,10 @@ def main():
     from miditok.classes import TokSequence
     ts = miditok_seq
     try:
-        midi = tokenizer.tokens_to_midi([TokSequence(ids=ts, ids_bpe_encoded=False)])
+        if hasattr(TokSequence, "ids_bpe_encoded"):
+            midi = tokenizer.tokens_to_midi([TokSequence(ids=ts, ids_bpe_encoded=False)])
+        else:
+            midi = tokenizer.tokens_to_midi([TokSequence(tokens=ts)])
     except Exception as e:
         print("Failed to convert to midi. Exception:", e)
         raise e

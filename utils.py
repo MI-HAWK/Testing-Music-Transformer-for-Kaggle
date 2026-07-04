@@ -5,7 +5,7 @@ import torch
 import numpy as np
 from pathlib import Path
 from collections import deque
-import wandb
+
 
 def load_config(path: str) -> dict:
     with open(path, "r") as f:
@@ -142,15 +142,3 @@ class CheckpointManager:
             oldest = self.tracked.popleft()
             if oldest.exists() and oldest.name.startswith("step_"):
                 oldest.unlink()
-
-class WandBLogger:
-    def __init__(self, enabled: bool):
-        self.enabled = enabled
-        
-    def log(self, metrics: dict, step: int):
-        if self.enabled:
-            wandb.log(metrics, step=step)
-            
-    def finish(self):
-        if self.enabled:
-            wandb.finish()

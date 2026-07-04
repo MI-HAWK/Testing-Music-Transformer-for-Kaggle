@@ -1,5 +1,5 @@
-maestro_root: /kaggle/input/datasets/arnavsadhwani/repo-12/cp_music_transformer/maestro-v3.0.0/
-midi_cache_dir: /kaggle/input/datasets/lakshaykhurana23/midi-files/cache/
+maestro_root: maestro-v3.0.0/
+midi_cache_dir: cache/
 max_seq_len: 512
 max_position_embeddings: 4096
 beat_subdivisions: 16
@@ -60,12 +60,12 @@ dropout: 0.2
 
 
 sampling:
-  tempo:        {tau: 1.2, top_p: 0.90}
-  position_bar: {tau: 1.2, top_p: 1.00}
-  pitch:        {tau: 1.0, top_p: 0.90}
-  duration:     {tau: 2.0, top_p: 0.90}
-  velocity:     {tau: 5.0, top_p: 1.00}
-  family:       {tau: 1.0, top_p: 0.90}
+  tempo:        {tau: 1.0, top_p: 0.90}
+  position_bar: {tau: 0.80, top_p: 0.85}
+  pitch:        {tau: 0.85, top_p: 0.85}
+  duration:     {tau: 0.85, top_p: 0.90}
+  velocity:     {tau: 0.90, top_p: 0.95}
+  family:       {tau: 0.80, top_p: 0.85}
 
 epochs: 200
 batch_size: 8
@@ -81,7 +81,7 @@ label_smoothing: 0.1
 val_every_steps: 1000
 save_every_steps: 1000
 keep_last_n_checkpoints: 5
-checkpoint_dir: /kaggle/working/checkpoints/
+checkpoint_dir: checkpoints/
 precision: fp16
 seed: 42
 
@@ -89,10 +89,6 @@ early_stopping:
   enabled: false
   patience: 20
   min_delta: 1.0e-4
-
-wandb:
-  project: cp-music-transformer
-  entity: null
 
 num_gpus: 2
 backend: nccl

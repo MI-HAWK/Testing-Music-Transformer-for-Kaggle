@@ -9,7 +9,7 @@ from torch.amp import autocast, GradScaler
 from pathlib import Path
 
 import time
-from utils import load_config, validate_config, set_seed, get_lr, get_param_groups, count_parameters, AverageMeter, CheckpointManager, WandBLogger
+from utils import load_config, validate_config, set_seed, get_lr, get_param_groups, count_parameters, AverageMeter, CheckpointManager
 from model import CPTransformer
 from dataloader import get_dataloader
 
@@ -18,7 +18,7 @@ def main():
     parser.add_argument("--config", type=str, default="config.yaml")
     parser.add_argument("--sanity", action="store_true")
     parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument("--wandb", action="store_true")
+
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -84,10 +84,6 @@ def main():
         cfg["val_every_steps"] = 10
         print("Sanity check mode enabled: taking 10 steps.")
         
-    logger = WandBLogger(enabled=args.wandb and rank == 0)
-    if args.wandb and rank == 0:
-        import wandb
-        wandb.init(project=cfg["wandb"]["project"], entity=cfg["wandb"]["entity"], config=cfg, resume="allow")
         
     chkpt_mgr = CheckpointManager(cfg["checkpoint_dir"], cfg["keep_last_n_checkpoints"])
     
@@ -157,7 +153,6 @@ def main():
                         "velocity_loss": loss_dict["velocity"].item(),
                     }
                     print(f"Ep {epoch} Stp {step} | Loss {loss_meter.avg:.4f} | LR {lr:.2e} | GNorm {grad_norm.item():.2f} | Scale {scale_val}")
-                    logger.log(metrics, step)
                     
                 if args.sanity and step >= 10:
                     print("Sanity check passed.")
@@ -188,7 +183,7 @@ def main():
                                 "best_val_loss": best_val_loss,
                                 "patience_counter": patience_counter
                             }, chkpt_path)
-                            if args.wandb: logger.finish()
+
                         if is_distributed: dist.destroy_process_group()
                         return
                     
@@ -212,7 +207,6 @@ def main():
                         
                     if rank == 0:
                         print(f"Validation at step {step}: val_loss={v_loss:.4f}")
-                        logger.log({"val_loss": v_loss}, step)
                         
                         # Early stopping and best model
                         if v_loss < best_val_loss - cfg["early_stopping"]["min_delta"]:
@@ -244,7 +238,6 @@ def main():
                         
                     if cfg["early_stopping"]["enabled"] and patience_counter >= cfg["early_stopping"]["patience"]:
                         if rank == 0: print(f"Early stopping at step {step}")
-                        if args.wandb and rank == 0: logger.finish()
                         if is_distributed: dist.destroy_process_group()
                         return
                                 
@@ -265,7 +258,7 @@ def main():
                     }, chkpt_path)
                     chkpt_mgr.track_checkpoint(chkpt_path)
                     
-    logger.finish()
+
     if is_distributed:
         dist.destroy_process_group()
 
